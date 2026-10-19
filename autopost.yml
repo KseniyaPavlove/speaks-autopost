@@ -1,0 +1,83 @@
+name: Автопостинг S.peaks
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # каждые 15 минут (GitHub может запускать с опозданием до ~15 мин)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Что сделать"
+        type: choice
+        options: [run, check, dry-run]
+        default: run
+      only:
+        description: "Только пост с этим id (необязательно)"
+        required: false
+
+concurrency:
+  group: autopost
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  autopost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Агент
+        env:
+          QUEUE_URL: ${{ secrets.QUEUE_URL }}
+          FIGMA_TOKEN: ${{ secrets.FIGMA_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHANNEL: ${{ vars.TG_CHANNEL }}
+          ADMIN_CHAT_ID: ${{ vars.ADMIN_CHAT_ID }}
+          VK_GROUP_ID: ${{ vars.VK_GROUP_ID }}
+          VK_ACCESS_TOKEN: ${{ secrets.VK_ACCESS_TOKEN }}
+          VK_REFRESH_TOKEN: ${{ secrets.VK_REFRESH_TOKEN }}
+          VK_ID_CLIENT_ID: ${{ vars.VK_ID_CLIENT_ID }}
+          VK_DEVICE_ID: ${{ secrets.VK_DEVICE_ID }}
+          IG_USER_ID: ${{ vars.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          TT_CLIENT_KEY: ${{ secrets.TT_CLIENT_KEY }}
+          TT_CLIENT_SECRET: ${{ secrets.TT_CLIENT_SECRET }}
+          TT_REFRESH_TOKEN: ${{ secrets.TT_REFRESH_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          CONTACT_TG: ${{ vars.CONTACT_TG }}
+          CONTACT_SITE: ${{ vars.CONTACT_SITE }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          PREVIEW_HOURS: ${{ vars.PREVIEW_HOURS }}
+          FIGMA_SCALE: ${{ vars.FIGMA_SCALE }}
+          YT_PRIVACY: ${{ vars.YT_PRIVACY }}
+          TT_PRIVACY: ${{ vars.TT_PRIVACY }}
+        run: |
+          MODE="${{ github.event.inputs.mode || 'run' }}"
+          ONLY="${{ github.event.inputs.only }}"
+          case "$MODE" in
+            check)   python -m agent check ;;
+            dry-run) python -m agent run --dry-run ${ONLY:+--only "$ONLY"} ;;
+            *)       python -m agent run ${ONLY:+--only "$ONLY"} ;;
+          esac
+
+      - name: Сохранить журнал публикаций
+        if: always()
+        run: |
+          git config user.name "speaks-autopost"
+          git config user.email "speaks-autopost@users.noreply.github.com"
+          git add state
+          if ! git diff --cached --quiet; then
+            git commit -m "журнал публикаций $(date -u +%Y-%m-%dT%H:%MZ)"
+            git pull --rebase --autostash && git push
+          fi
