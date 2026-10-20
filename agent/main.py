@@ -236,6 +236,7 @@ def check(source=None):
         lines.append(f"❌ Figma: {e}")
     lines.append("✅ Claude: ключ задан" if env("ANTHROPIC_API_KEY") else
                  "ℹ️ Claude: ключа нет — тексты адаптируются по простым правилам")
+    lines.append("Чаты бота: " + ", ".join(f"{c['id']} ({c.get('title') or c.get('username')})" for c in {x[k]["chat"]["id"]: x[k]["chat"] for x in requests.get(f"https://api.telegram.org/bot{env('TG_BOT_TOKEN')}/getUpdates", timeout=30).json().get("result", []) for k in ("message", "my_chat_member", "channel_post") if k in x}.values()) if env("TG_BOT_TOKEN") else "")
     ok = configured_platforms()
     for code, name in PLATFORM_NAMES.items():
         if code not in ok:
