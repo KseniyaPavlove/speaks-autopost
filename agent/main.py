@@ -27,23 +27,39 @@ def _texts_report(texts: dict) -> str:
 
 
 def prepare_media(post, platforms, workdir: Path, dry_run=False, with_video=True):
-    """Готовит картинки/видео для поста. В dry-run без ключа Figma — заглушки."""
+    """Готовит картинки/видео поста из Figma или Google Drive. В dry-run без ключей — заглушки."""
     urls, paths, video = [], [], None
-    need_images = post.format in ("post", "carousel") or (post.format == "story" and not post.video)
-    if need_images:
+    if post.format == "reels":
+        if with_video and not dry_run:
+            video = media.fetch_video(post.drive[0], workdir)
+        return urls, paths, video
+    if post.figma:
         if dry_run and not env("FIGMA_TOKEN"):
-            urls = [f"https://example.com/{i}.jpg" for i in range(len(post.figma))]
-        else:
-            fg = media.Figma()
-            slides = fg.slides(post.figma, multi=post.format == "carousel")
-            if post.format == "post":
-                slides = slides[:1]
-            urls = fg.export(slides)
-            if set(platforms) & {"tg", "vk"}:
-                paths = [media.download(u, workdir / f"slide{i + 1:02d}.jpg") for i, u in enumerate(urls)]
-    if with_video and post.video and post.format in ("reels", "story") and not dry_run:
-        video = media.fetch_video(post.video, workdir)
-    return urls, paths, video
+            return [f"https://example.com/{i}.jpg" for i in range(len(post.figma))], [], None
+        fg = media.Figma()
+        slides = fg.slides(post.figma, multi=post.format in ("carousel", "story"))
+        if post.format == "post":
+            slides = slides[:1]
+        urls = fg.export(slides)
+        if set(platforms) & {"tg", "vk"}:
+            paths = [media.download(u, workdir / f"slide{i + 1:02d}.jpg") for i, u in enumerate(urls)]
+        return urls, paths, None
+    # Google Drive
+    links = post.drive[:1] if post.format == "post" else post.drive
+    if dry_run:
+        return [f"https://example.com/drive{i}.jpg" for i in range(len(links))], [], None
+    files = [media.fetch_drive(link, workdir / f"file{i + 1:02d}") for i, link in enumerate(links)]
+    if post.format == "story" and media.kind(files[0]) == "video":
+        return [], [], files[0] if with_video else None
+    files = [f for f in files if media.kind(f) == "image"]
+    paths = [media.to_jpeg(f) for f in files]
+    if "ig" in platforms:
+        urls = media.host_public(paths, post.id)
+    return urls, paths, None
+
+
+def label(post):
+    return f"«{post.title}» ({post.sheet}, строка {post.line})"
 
 
 def run(source=None, dry_run=False, now=None, only=None, log=print):
@@ -72,16 +88,19 @@ def run(source=None, dry_run=False, now=None, only=None, log=print):
         if post.errors:
             key = f"err:{post.id}:{post.fingerprint}"
             if not state.flag(key):
-                notify.admin(f"❗ Строка {post.line} ({post.id}) не будет опубликована:\n• " + "\n• ".join(post.errors))
+                notify.admin(f"❗ {label(post)} не будет опубликован:\n• " + "\n• ".join(post.errors))
                 state.set_flag(key)
             continue
         missing = [p for p in post.platforms if p not in ready_platforms]
         if missing and not state.flag(f"nocfg:{post.id}"):
-            notify.admin(f"ℹ️ {post.id}: не подключены {names(missing)} — пропускаю их")
+            notify.admin(f"ℹ️ {label(post)}: не подключены {names(missing)} — пропускаю их")
             state.set_flag(f"nocfg:{post.id}")
         if post.skipped and not state.flag(f"unsup:{post.id}"):
-            notify.admin(f"ℹ️ {post.id}: формат «{post.format}» не публикуется в {names(post.skipped)} через API")
+            notify.admin(f"ℹ️ {label(post)}: формат «{post.format}» не публикуется в {names(post.skipped)} через API")
             state.set_flag(f"unsup:{post.id}")
+        if post.other and not state.flag(f"other:{post.id}"):
+            notify.admin(f"ℹ️ {label(post)}: в {', '.join(post.other)} агент пока не публикует — их выложите вручную")
+            state.set_flag(f"other:{post.id}")
         platforms = [p for p in post.platforms if p in ready_platforms]
         if not platforms:
             continue
@@ -100,7 +119,7 @@ def run(source=None, dry_run=False, now=None, only=None, log=print):
                     texts_note = f"\n\n⚠️ Медиа не подготовились: {e}"
                 else:
                     texts_note = ""
-                head = (f"👀 Превью: {post.id} — {post.format}, {post.when:%d.%m %H:%M}\n"
+                head = (f"👀 Превью: {label(post)} — {post.format}, {post.when:%d.%m %H:%M}\n"
                         f"Куда: {names(platforms)}\n"
                         f"Поправить текст можно в колонках текст_tg / текст_vk / … таблицы.{texts_note}\n\n")
                 notify.admin(head + _texts_report(texts), photo_path=paths[0] if paths else None)
@@ -118,7 +137,7 @@ def run(source=None, dry_run=False, now=None, only=None, log=print):
         if -until > dt.timedelta(hours=MAX_LATE_HOURS) and not any(state.status(post.id, p) for p in pending):
             for p in pending:
                 state.record(post.id, p, "skipped", reason="опоздали")
-            notify.admin(f"⏰ {post.id} ({post.when:%d.%m %H:%M}) не опубликован: прошло больше "
+            notify.admin(f"⏰ {label(post)} ({post.when:%d.%m %H:%M}) не опубликован: прошло больше "
                          f"{MAX_LATE_HOURS} ч. Поменяйте дату в таблице, если он ещё нужен.")
             continue
 
@@ -130,7 +149,7 @@ def run(source=None, dry_run=False, now=None, only=None, log=print):
         except Exception as e:
             for p in pending:
                 state.record(post.id, p, "error", error=f"медиа: {e}")
-            notify.admin(f"❌ {post.id}: не удалось подготовить медиа — {e}")
+            notify.admin(f"❌ {label(post)}: не удалось подготовить медиа — {e}")
             shutil.rmtree(workdir, ignore_errors=True)
             continue
         for p in pending:
@@ -151,17 +170,39 @@ def run(source=None, dry_run=False, now=None, only=None, log=print):
                 line = f"❌ {PLATFORM_NAMES[p]}: {e}" + (f" (повторю, осталось попыток: {left})" if left > 0 else " (больше не пытаюсь)")
             report.append(line)
         shutil.rmtree(workdir, ignore_errors=True)
-        msg = f"📣 {post.id} — {post.format}, {post.when:%d.%m %H:%M}\n" + "\n".join(report)
+        msg = f"📣 {label(post)} — {post.format}, {post.when:%d.%m %H:%M}\n" + "\n".join(report)
         if dry_run:
             msg += "\n\n" + _texts_report(texts)
         notify.admin(msg) if not dry_run else log(msg)
         summary.append(msg)
         if not dry_run:
             state.save()  # сохраняем после каждого поста, чтобы не задублировать при сбое
+            _write_back(post, platforms, state)
 
     if not dry_run:
         state.save()
     return summary
+
+
+def _write_back(post, platforms, state):
+    """Когда пост дошёл до финала — ставим статус и ссылки в контент-плане."""
+    from . import sheets
+    statuses = {p: state.status(post.id, p) for p in platforms}
+    finished = all(s in DONE or state.attempts(post.id, p) >= MAX_ATTEMPTS for p, s in statuses.items())
+    if not finished or state.flag(f"wb:{post.id}"):
+        return
+    all_ok = all(s == "ok" for s in statuses.values())
+    links = [state.entry(post.id, p).get("url") for p in platforms
+             if statuses[p] == "ok" and (state.entry(post.id, p).get("url") or "").startswith("http")]
+    try:
+        wrote = sheets.write_back(post, queue.DONE_STATUS if all_ok else queue.FAILED_STATUS,
+                                  links, post.published_links)
+    except Exception as e:
+        notify.admin(f"⚠️ {label(post)}: опубликовано, но не смог отметить в таблице — {e}")
+        return
+    if wrote:
+        state.set_flag(f"wb:{post.id}")
+        state.save()
 
 
 def _captions(post, platforms, state, log, dry_run=False):

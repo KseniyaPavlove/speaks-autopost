@@ -1,4 +1,9 @@
-"""Чтение очереди публикаций из Google-таблицы (или локального CSV)."""
+"""Чтение контент-плана: Google-таблица (через сервисный аккаунт) или CSV для тестов.
+
+Агент понимает «живой» контент-план S.peaks: колонки «Дата», «Время», «Формат», «Площадки»,
+«Тема / заголовок», «Ссылка на макет», «Подпись к публикации», «Статус», «Ссылка на публикацию».
+Публикуются только строки со статусом «Готово к публикации».
+"""
 import csv
 import datetime as dt
 import hashlib
@@ -7,22 +12,27 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
-import requests
+from .config import TZ, env
 
-from .config import TZ
-
-# Заголовки таблицы -> внутренние ключи. Регистр и пробелы не важны.
+# Заголовки таблицы -> внутренние ключи. Регистр, пробелы и «ё» не важны.
 HEADERS = {
     "id": "id",
     "дата": "date",
     "время": "time",
+    "время публикации": "time",
     "формат": "format",
     "площадки": "platforms",
-    "figma": "figma",
-    "фигма": "figma",
-    "видео": "video",
+    "тема / заголовок": "topic",
+    "тема": "topic",
+    "заголовок": "topic",
+    "ссылка на макет": "media",
+    "макет": "media",
+    "figma": "media",
+    "фигма": "media",
+    "видео": "media",
+    "подпись к публикации": "text",
+    "подпись": "text",
     "текст": "text",
     "текст_ig": "text_ig",
     "текст_tg": "text_tg",
@@ -31,25 +41,28 @@ HEADERS = {
     "заголовок_yt": "title_yt",
     "текст_yt": "text_yt",
     "статус": "status",
-    "комментарий": "note",
+    "ссылка на публикацию": "links",
 }
 
 FORMATS = {
     "пост": "post", "post": "post", "фото": "post", "картинка": "post",
     "карусель": "carousel", "carousel": "carousel",
-    "reels": "reels", "рилс": "reels", "видео": "reels", "shorts": "reels", "клип": "reels",
+    "reels": "reels", "reel": "reels", "рилс": "reels", "видео": "reels", "shorts": "reels", "клип": "reels",
     "сторис": "story", "stories": "story", "story": "story",
 }
 
+# Площадки из плана, которые агент пока не публикует (не ошибка — просто пропускаем)
+KNOWN_UNSUPPORTED = {"facebook": "Facebook", "facebook reels": "Facebook", "fb": "Facebook",
+                     "max": "MAX", "макс": "MAX", "сайт": "сайт"}
+
 PLATFORM_ALIASES = {
-    "ig": "ig", "instagram": "ig", "инста": "ig", "инстаграм": "ig", "inst": "ig",
-    "tg": "tg", "telegram": "tg", "телеграм": "tg", "тг": "tg",
-    "vk": "vk", "вк": "vk", "вконтакте": "vk",
-    "yt": "yt", "youtube": "yt", "ютуб": "yt", "shorts": "yt",
-    "tt": "tt", "tiktok": "tt", "тикток": "tt",
+    "instagram": "ig", "instagram stories": "ig", "ig": "ig", "инстаграм": "ig", "инста": "ig",
+    "telegram": "tg", "tg": "tg", "телеграм": "tg", "тг": "tg",
+    "vk": "vk", "вк": "vk", "вконтакте": "vk", "vk клипы": "vk",
+    "youtube": "yt", "youtube shorts": "yt", "shorts": "yt", "yt": "yt", "ютуб": "yt",
+    "tiktok": "tt", "tt": "tt", "тикток": "tt",
 }
 
-# Какие площадки умеют какой формат (через официальные API)
 SUPPORTED = {
     "post": ["ig", "tg", "vk"],
     "carousel": ["ig", "tg", "vk"],
@@ -57,9 +70,26 @@ SUPPORTED = {
     "story": ["ig"],
 }
 
-READY_WORDS = {"готово", "ready", "да", "ok", "ок", "✅", "+", "в работу", "публиковать"}
+READY_WORDS = {"готово к публикации", "готово", "ready", "автопостинг"}
+DONE_STATUS = "Опубликовано"
+FAILED_STATUS = "Ошибка публикации"
 
 DATE_FORMATS = ["%d.%m.%Y", "%Y-%m-%d", "%d.%m.%y", "%d/%m/%Y"]
+URL_RE = re.compile(r"https?://[^\s,;]+")
+
+
+@dataclass
+class Cell:
+    text: str = ""
+    links: list = field(default_factory=list)
+
+    @property
+    def all_links(self):
+        out = list(self.links)
+        for u in URL_RE.findall(self.text):
+            if u not in out:
+                out.append(u)
+        return out
 
 
 @dataclass
@@ -70,68 +100,46 @@ class Post:
     format: str | None
     platforms: list
     figma: list
-    video: str
+    drive: list
+    topic: str
     text: str
     overrides: dict
     status: str
-    skipped: list = field(default_factory=list)  # запрошены, но формат не поддерживается
+    sheet: str = ""
+    published_links: str = ""
+    columns: dict = field(default_factory=dict)  # ключ -> индекс колонки (для записи обратно)
+    skipped: list = field(default_factory=list)
+    other: list = field(default_factory=list)  # Facebook, MAX, сайт — пока вручную
     errors: list = field(default_factory=list)
 
     @property
     def ready(self) -> bool:
-        return self.status.strip().lower() in READY_WORDS
+        return norm(self.status) in READY_WORDS
+
+    @property
+    def video(self):
+        return self.drive[0] if self.format == "reels" and self.drive else ""
+
+    @property
+    def title(self):
+        return self.topic or (self.text.splitlines() or [""])[0][:60] or self.id
 
     @property
     def fingerprint(self) -> str:
         payload = json.dumps(
             [self.when.isoformat() if self.when else None, self.format, self.platforms,
-             self.figma, self.video, self.text, self.overrides],
-            ensure_ascii=False, sort_keys=True,
-        )
+             self.figma, self.drive, self.text, self.overrides],
+            ensure_ascii=False, sort_keys=True)
         return hashlib.sha1(payload.encode()).hexdigest()[:12]
 
 
-def sheet_csv_url(url: str) -> str:
-    """Ссылку на Google-таблицу превращаем в ссылку на CSV-выгрузку нужного листа."""
-    if "docs.google.com/spreadsheets" not in url or "format=csv" in url or "output=csv" in url:
-        return url
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
-    if not m:
-        return url
-    gid = None
-    parsed = urlparse(url)
-    for part in (parsed.fragment, parsed.query):
-        q = parse_qs(part)
-        if "gid" in q:
-            gid = q["gid"][0]
-    out = f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=csv"
-    return out + (f"&gid={gid}" if gid else "")
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower().replace("ё", "е"))
 
 
-def _read_source(source: str) -> str:
-    if source.startswith("http"):
-        r = requests.get(sheet_csv_url(source), timeout=60)
-        r.raise_for_status()
-        r.encoding = "utf-8"
-        if r.text.lstrip().startswith("<"):
-            raise RuntimeError(
-                "Таблица не отдаёт CSV — откройте доступ «Все, у кого есть ссылка: читатель»"
-            )
-        return r.text
-    return Path(source).read_text(encoding="utf-8-sig")
-
-
-def _norm_header(h: str) -> str:
-    key = re.sub(r"\s+", "_", (h or "").strip().lower())
-    return HEADERS.get(key, key)
-
-
-def _split(value: str) -> list:
-    return [x for x in re.split(r"[\s,;]+", value or "") if x]
-
-
-def _parse_when(date_s: str, time_s: str, errors: list):
-    date_s, time_s = (date_s or "").strip(), (time_s or "").strip() or "10:00"
+def _parse_when(date_s, time_s, errors):
+    date_s = (date_s or "").strip()
+    time_s = (time_s or "").strip() or env("DEFAULT_TIME", "12:00")
     day = None
     for fmt in DATE_FORMATS:
         try:
@@ -142,8 +150,7 @@ def _parse_when(date_s: str, time_s: str, errors: list):
     if day is None:
         m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", date_s)
         if m:
-            today = dt.datetime.now(TZ).date()
-            day = dt.date(today.year, int(m.group(2)), int(m.group(1)))
+            day = dt.date(dt.datetime.now(TZ).year, int(m.group(2)), int(m.group(1)))
     if day is None:
         errors.append(f"не понял дату «{date_s}» (нужно ДД.ММ.ГГГГ)")
         return None
@@ -154,65 +161,121 @@ def _parse_when(date_s: str, time_s: str, errors: list):
     return dt.datetime.combine(day, dt.time(int(m.group(1)), int(m.group(2))), tzinfo=TZ)
 
 
-def parse_rows(text: str) -> list:
-    reader = csv.reader(io.StringIO(text))
-    rows = list(reader)
+def _platforms(raw: str, errors: list, other: list):
+    raw = re.sub(r"(?i)дубли\s*:", ",", raw or "")
+    parts = [norm(p) for p in re.split(r"[,;\n/+]+", raw) if p.strip()]
+    if not parts or parts in (["все"], ["all"]):
+        return ["ig", "tg", "vk", "yt", "tt"], False
+    out = []
+    for p in parts:
+        code = PLATFORM_ALIASES.get(p) or PLATFORM_ALIASES.get(p.split()[0])
+        if code is None:
+            name = KNOWN_UNSUPPORTED.get(p) or KNOWN_UNSUPPORTED.get(p.split()[0])
+            if name:
+                if name not in other:
+                    other.append(name)
+            else:
+                errors.append(f"неизвестная площадка «{p}»")
+        elif code not in out:
+            out.append(code)
+    return out, True
+
+
+def _format(raw: str):
+    """«Серия Stories; 3 кадра» -> story, «Reels; блогер» -> reels, «Лонгрид №3» -> None (не соцсети)."""
+    head = norm(re.split(r"[;(]", raw or "")[0])
+    if head in FORMATS:
+        return FORMATS[head]
+    for key, fmt in (("stor", "story"), ("сторис", "story"), ("reel", "reels"), ("рилс", "reels"),
+                     ("клип", "reels"), ("карусел", "carousel"), ("пост", "post")):
+        if key in head:
+            return fmt
+    return None
+
+
+def is_figma(u):
+    return "figma.com" in u
+
+
+def is_drive(u):
+    return "drive.google.com" in u or "docs.google.com/uc" in u
+
+
+def parse_table(rows: list, sheet: str = "") -> list:
+    """rows — список строк, каждая строка — список Cell. Первая строка — заголовки."""
     if not rows:
         return []
-    headers = [_norm_header(h) for h in rows[0]]
+    columns = {}
+    for j, c in enumerate(rows[0]):
+        key = HEADERS.get(norm(c.text))
+        if key and key not in columns:
+            columns[key] = j
+    if "date" not in columns or "status" not in columns:
+        return []  # не контент-план
+
+    def get(row, key) -> Cell:
+        j = columns.get(key)
+        return row[j] if j is not None and j < len(row) else Cell()
+
     posts = []
-    for i, raw in enumerate(rows[1:], start=2):
-        d = {headers[j]: (raw[j] if j < len(raw) else "") for j in range(len(headers))}
-        if not any(v.strip() for v in d.values()):
+    for i, row in enumerate(rows[1:], start=2):
+        status = get(row, "status").text
+        if not any(c.text.strip() for c in row):
             continue
         errors = []
-        when = _parse_when(d.get("date", ""), d.get("time", ""), errors)
-
-        fmt_raw = d.get("format", "").strip().lower()
-        fmt = FORMATS.get(fmt_raw)
+        when = _parse_when(get(row, "date").text, get(row, "time").text, errors)
+        fmt_raw = get(row, "format").text.strip()
+        fmt = _format(fmt_raw)
         if not fmt:
-            errors.append(f"неизвестный формат «{fmt_raw}» (пост / карусель / reels / сторис)")
-
-        plat_raw = _split(d.get("platforms", "").lower())
-        if not plat_raw or plat_raw == ["все"] or plat_raw == ["all"]:
-            wanted = ["ig", "tg", "vk", "yt", "tt"]
-        else:
-            wanted = []
-            for p in plat_raw:
-                code = PLATFORM_ALIASES.get(p)
-                if code is None:
-                    errors.append(f"неизвестная площадка «{p}»")
-                elif code not in wanted:
-                    wanted.append(code)
+            errors.append(f"формат «{fmt_raw}» агент не публикует (пост / карусель / reels / stories)")
+        other = []
+        wanted, explicit = _platforms(get(row, "platforms").text, errors, other)
         allowed = SUPPORTED.get(fmt, [])
         platforms = [p for p in wanted if p in allowed]
-        explicit = plat_raw and plat_raw not in (["все"], ["all"])
         skipped = [p for p in wanted if p not in allowed] if explicit else []
 
-        figma = [x for x in _split(d.get("figma", "")) if "figma.com" in x]
-        video = d.get("video", "").strip()
-        if fmt in ("post", "carousel") and not figma:
-            errors.append("нет ссылки на фрейм Figma")
-        if fmt == "reels" and not video:
-            errors.append("для reels нужна ссылка на видео")
-        if fmt == "story" and not (figma or video):
-            errors.append("для сторис нужна ссылка на Figma или видео")
+        links = get(row, "media").all_links
+        figma = [u for u in links if is_figma(u)]
+        drive = [u for u in links if is_drive(u)]
+        if fmt in ("post", "carousel", "story") and not (figma or drive):
+            errors.append("в «Ссылке на макет» нет ссылки на Figma или Google Drive")
+        if fmt == "reels" and not drive:
+            errors.append("для Reels нужна ссылка на видео в Google Drive в «Ссылке на макет»")
 
-        overrides = {
-            k: d.get(k, "").strip()
-            for k in ("text_ig", "text_tg", "text_vk", "text_tt", "title_yt", "text_yt")
-            if d.get(k, "").strip()
-        }
-        pid = (d.get("id") or "").strip()
+        overrides = {k: get(row, k).text.strip()
+                     for k in ("text_ig", "text_tg", "text_vk", "text_tt", "title_yt", "text_yt")
+                     if get(row, k).text.strip()}
+        topic = get(row, "topic").text.strip()
+        pid = get(row, "id").text.strip()
         if not pid and when:
-            pid = f"{when:%Y%m%d-%H%M}-{fmt or 'x'}"
+            key = topic or get(row, "text").text or " ".join(links)
+            pid = f"{when:%Y%m%d}-{fmt or 'x'}-{hashlib.sha1(key.encode()).hexdigest()[:6]}"
         posts.append(Post(
-            id=pid or f"line{i}", line=i, when=when, format=fmt, platforms=platforms,
-            figma=figma, video=video, text=d.get("text", "").strip(), overrides=overrides,
-            status=d.get("status", ""), skipped=skipped, errors=errors,
-        ))
+            id=pid or f"{sheet}-{i}", line=i, when=when, format=fmt, platforms=platforms,
+            figma=figma, drive=drive, topic=topic, text=get(row, "text").text.strip(),
+            overrides=overrides, status=status, sheet=sheet, columns=columns,
+            published_links=get(row, "links").text,
+            skipped=skipped, other=other, errors=errors))
     return posts
 
 
-def load(source: str) -> list:
-    return parse_rows(_read_source(source))
+# ---------- источники ----------
+
+def load_csv(path: str) -> list:
+    text = Path(path).read_text(encoding="utf-8-sig")
+    rows = [[Cell(text=v) for v in r] for r in csv.reader(io.StringIO(text))]
+    return parse_table(rows, sheet=Path(path).stem)
+
+
+def load(source: str | None = None) -> list:
+    source = source or env("QUEUE_URL")
+    if not source:
+        raise SystemExit("Не задан QUEUE_URL — ссылка на контент-план")
+    if not source.startswith("http"):
+        return load_csv(source)
+    from .sheets import Sheet
+    sheet = Sheet(source)
+    posts = []
+    for title, rows in sheet.tables():
+        posts.extend(parse_table(rows, sheet=title))
+    return posts

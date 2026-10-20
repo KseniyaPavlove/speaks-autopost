@@ -96,14 +96,97 @@ def download(url: str, dest: Path) -> Path:
     return dest
 
 
+def drive_id(link: str):
+    m = re.search(r"/d/([a-zA-Z0-9_-]{10,})", link) or re.search(r"[?&]id=([a-zA-Z0-9_-]{10,})", link)
+    return m.group(1) if m else None
+
+
+def fetch_drive(link: str, dest: Path) -> Path:
+    """Файл с Google Drive: сначала по публичной ссылке, затем от имени сервисного аккаунта."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fid = drive_id(link)
+    if not fid:
+        raise RuntimeError(f"не понял ссылку на Google Drive: {link}")
+    try:
+        import gdown
+        path = gdown.download(id=fid, output=str(dest), quiet=True)
+        if path and Path(path).exists() and Path(path).stat().st_size > 1000 and not _is_html(Path(path)):
+            return Path(path)
+    except Exception:
+        pass
+    if env("GOOGLE_SA_JSON"):
+        from .sheets import drive_download
+        try:
+            return drive_download(fid, dest)
+        except Exception:
+            pass
+    raise RuntimeError("не удалось скачать файл с Google Drive — откройте доступ «Все, у кого есть ссылка» "
+                       "или откройте файл/папку для сервисного аккаунта")
+
+
+def _is_html(path: Path) -> bool:
+    with open(path, "rb") as f:
+        head = f.read(512).lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+
+def kind(path: Path) -> str:
+    """image | video по сигнатуре файла."""
+    with open(path, "rb") as f:
+        head = f.read(32)
+    if head[4:8] == b"ftyp" or head[:4] in (b"\x1aE\xdf\xa3",) or head[:3] == b"FLV":
+        return "video"
+    return "image"
+
+
+def to_jpeg(path: Path) -> Path:
+    """Instagram принимает только JPEG."""
+    from PIL import Image
+    out = path.with_suffix(".jpg")
+    with Image.open(path) as im:
+        im.convert("RGB").save(out, "JPEG", quality=92)
+    return out
+
+
 def fetch_video(link: str, workdir: Path) -> Path:
-    dest = workdir / "video.mp4"
     if "drive.google.com" in link or "docs.google.com" in link:
-        import gdown  # тянем только когда нужно
-        path = gdown.download(url=link, output=str(dest), quiet=True, fuzzy=True)
-        if not path or not Path(path).exists() or Path(path).stat().st_size < 10_000:
-            raise RuntimeError("не удалось скачать видео с Google Drive — откройте доступ по ссылке")
-        return Path(path)
+        return fetch_drive(link, workdir / "video.mp4")
     if "dropbox.com" in link:
         link = re.sub(r"dl=0", "dl=1", link)
-    return download(link, dest)
+    return download(link, workdir / "video.mp4")
+
+
+def host_public(paths: list, post_id: str) -> list:
+    """Кладёт картинки в ветку media репозитория и возвращает публичные ссылки (нужно Instagram)."""
+    import shutil
+    import subprocess
+    import tempfile
+    repo, token = env("GITHUB_REPOSITORY"), env("GITHUB_TOKEN")
+    if not (repo and token):
+        raise RuntimeError("для картинок с Google Drive в Instagram нужен запуск на GitHub (GITHUB_TOKEN)")
+    url = f"https://x-access-token:{token}@github.com/{repo}.git"
+    tmp = Path(tempfile.mkdtemp(prefix="media-"))
+
+    def git(*args, check=True):
+        return subprocess.run(["git", *args], cwd=tmp, check=check, capture_output=True, text=True)
+
+    git("init", "-q")
+    git("config", "user.name", "speaks-autopost")
+    git("config", "user.email", "speaks-autopost@users.noreply.github.com")
+    git("remote", "add", "origin", url)
+    if git("fetch", "-q", "--depth", "1", "origin", "media", check=False).returncode == 0:
+        git("checkout", "-q", "-b", "media", "FETCH_HEAD")
+    else:
+        git("checkout", "-q", "--orphan", "media")
+    folder = tmp / post_id
+    folder.mkdir(parents=True, exist_ok=True)
+    names = []
+    for i, p in enumerate(paths, start=1):
+        name = f"{i:02d}.jpg"
+        shutil.copy(p, folder / name)
+        names.append(name)
+    git("add", ".")
+    git("commit", "-q", "-m", f"media {post_id}", check=False)
+    git("push", "-q", "origin", "media")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return [f"https://raw.githubusercontent.com/{repo}/media/{post_id}/{n}" for n in names]

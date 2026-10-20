@@ -76,10 +76,14 @@ def publish(job):
         return _publish(cid)
     if job.format == "story":
         if job.video_path:
-            cid = _upload_video(job.video_path, media_type="STORIES")
-        else:
-            cid = _req("POST", f"/{_ig()}/media", media_type="STORIES", image_url=job.image_urls[0])["id"]
-        return _publish(cid)
+            return _publish(_upload_video(job.video_path, media_type="STORIES"))
+        res = None
+        for u in job.image_urls[:10]:  # серия сторис — по кадру
+            cid = _req("POST", f"/{_ig()}/media", media_type="STORIES", image_url=u)["id"]
+            res = _publish(cid)
+        if len(job.image_urls) > 1:
+            res["note"] = f"опубликовано кадров: {min(len(job.image_urls), 10)}"
+        return res
     if len(job.image_urls) == 1:
         cid = _req("POST", f"/{_ig()}/media", image_url=job.image_urls[0], caption=caption)["id"]
         return _publish(cid)

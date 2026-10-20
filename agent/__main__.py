@@ -30,8 +30,8 @@ def cli():
         for p in queue.load(a.source or env("QUEUE_URL")):
             when = f"{p.when:%d.%m %H:%M}" if p.when else "??"
             flag = "✅" if p.ready else "· "
-            print(f"{flag} {p.id:<22} {when}  {p.format or '?':<8} {','.join(p.platforms):<16} "
-                  f"слайдов:{len(p.figma)} видео:{'да' if p.video else 'нет'} "
+            print(f"{flag} [{p.sheet} #{p.line}] {when}  {p.format or '?':<8} {','.join(p.platforms):<14} "
+                  f"figma:{len(p.figma)} drive:{len(p.drive)}  {p.title[:40]}  "
                   + ("ОШИБКИ: " + "; ".join(p.errors) if p.errors else ""))
 
 
